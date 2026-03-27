@@ -72,7 +72,6 @@ class FakeAudioTrack(MediaStreamTrack):
         return frame
 
 
-
 class SIPAuthHelper:
     @staticmethod
     def parse_authenticate_header(header_value: str) -> dict[str, str]:
@@ -372,12 +371,8 @@ class WebRTCTester:
             "Content-Length: 0\r\n\r\n"
         )
 
-    def build_reinvite_ok(self, request: dict[str, Any]) -> str:
+    def build_reinvite_ok(self, request: dict[str, Any], answer_sdp: str = "") -> str:
         headers = request.get("headers", {})
-        answer_sdp = ""
-        if self.pc.localDescription and self.pc.localDescription.sdp:
-            answer_sdp = self.pc.localDescription.sdp
-
         content_type = "Content-Type: application/sdp\r\n" if answer_sdp else ""
         return (
             "SIP/2.0 200 OK\r\n"
@@ -391,12 +386,31 @@ class WebRTCTester:
             f"{answer_sdp}"
         )
 
+    async def handle_reinvite(self, request: dict[str, Any]) -> str:
+        body = request.get("body", "")
+        if not body:
+            return self.build_reinvite_ok(request, "")
+
+        sanitized_offer = self.sanitize_sdp(body)
+        await self.pc.setRemoteDescription(RTCSessionDescription(sdp=sanitized_offer, type="offer"))
+        answer = await self.pc.createAnswer()
+        await self.pc.setLocalDescription(answer)
+        return self.build_reinvite_ok(request, self.pc.localDescription.sdp if self.pc.localDescription else "")
+
     def parse_sip_message(self, raw: str) -> dict[str, Any]:
-        normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
-        lines = normalized.split("\n")
-        if not lines or not lines[0]:
+        if not raw:
             raise ValueError("empty SIP message")
-        start = lines[0]
+
+        separator = "\r\n\r\n" if "\r\n\r\n" in raw else "\n\n"
+        if separator in raw:
+            head, body_blob = raw.split(separator, 1)
+        else:
+            head, body_blob = raw, ""
+
+        lines = head.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if not lines or not lines[0]:
+            raise ValueError("empty SIP start line")
+        start = lines[0].strip()
         status_code = None
         method = None
         if start.startswith("SIP/2.0"):
@@ -411,19 +425,23 @@ class WebRTCTester:
             method = m.group(1)
 
         headers: dict[str, str] = {}
-        body_lines: list[str] = []
-        in_body = False
         for line in lines[1:]:
-            if line == "" and not in_body:
-                in_body = True
+            if line == "":
                 continue
-            if not in_body and ":" in line:
+            if ":" in line:
                 k, v = line.split(":", 1)
                 headers[k.strip()] = v.strip()
-            elif in_body:
-                body_lines.append(line)
 
-        return {"status_code": status_code, "method": method, "headers": headers, "body": "\r\n".join(body_lines).strip()}
+        content_length = headers.get("Content-Length", headers.get("l", ""))
+        body = body_blob
+        if content_length:
+            try:
+                expected = int(content_length)
+                body = body_blob[:expected]
+            except ValueError:
+                pass
+        body = body.strip("\r\n")
+        return {"status_code": status_code, "method": method, "headers": headers, "body": body}
 
     def sanitize_sdp(self, sdp: str) -> str:
         def default_m_line(media_type: str) -> str | None:
@@ -636,7 +654,8 @@ class WebRTCTester:
                     break
                 if method == "INVITE":
                     # Re-INVITE: подтверждаем диалог и НЕ рвем звонок.
-                    await self.websocket.send(self.build_reinvite_ok(parsed))
+                    reinvite_ok = await self.handle_reinvite(parsed)
+                    await self.websocket.send(reinvite_ok)
                     continue
                 if method == "ACK":
                     continue
