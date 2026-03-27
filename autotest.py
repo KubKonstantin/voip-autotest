@@ -373,6 +373,15 @@ class WebRTCTester:
         return {"status_code": status_code, "method": method, "headers": headers, "body": "\r\n".join(body_lines).strip()}
 
     def sanitize_sdp(self, sdp: str) -> str:
+        def default_m_line(media_type: str) -> str | None:
+            if media_type == "audio":
+                return "m=audio 9 UDP/TLS/RTP/SAVPF 111"
+            if media_type == "video":
+                return "m=video 9 UDP/TLS/RTP/SAVPF 96"
+            if media_type == "application":
+                return "m=application 9 UDP/DTLS/SCTP webrtc-datachannel"
+            return None
+
         lines: list[str] = []
         for raw_line in sdp.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
             line = raw_line.strip()
@@ -381,8 +390,11 @@ class WebRTCTester:
             if line.startswith("m="):
                 media = line[2:].split()
                 if len(media) < 4:
-                    if media and media[0] == "audio":
-                        line = "m=audio 9 UDP/TLS/RTP/SAVPF 111"
+                    if media:
+                        fallback = default_m_line(media[0])
+                        if not fallback:
+                            continue
+                        line = fallback
                     else:
                         continue
             lines.append(line)
@@ -516,7 +528,14 @@ class WebRTCTester:
             if not answer:
                 raise RuntimeError("SIP INVITE failed after max_attempts")
 
-            await self.pc.setRemoteDescription(answer)
+            remote_description_set = False
+            try:
+                await self.pc.setRemoteDescription(answer)
+                remote_description_set = True
+            except ValueError as exc:
+                self.logger.warning("WARN: remote SDP rejected by aiortc: %s", exc)
+                self.recorder.finish_stage(rtp_stage, "failed", f"Remote SDP rejected by aiortc: {exc}")
+
             ack = self.build_sip_ack()
             await self.websocket.send(ack)
             register_mark = "REGISTER + " if self.config.register_before_invite else ""
@@ -526,8 +545,9 @@ class WebRTCTester:
                 f"{register_mark}INVITE/200/ACK completed in single SIP session",
             )
 
-            rtp_ok, rtp_details = await self.validate_rtp_phase()
-            self.recorder.finish_stage(rtp_stage, "passed" if rtp_ok else "failed", rtp_details)
+            if remote_description_set:
+                rtp_ok, rtp_details = await self.validate_rtp_phase()
+                self.recorder.finish_stage(rtp_stage, "passed" if rtp_ok else "failed", rtp_details)
 
             try:
                 msg = await asyncio.wait_for(self.websocket.recv(), timeout=self.config.call_duration)
