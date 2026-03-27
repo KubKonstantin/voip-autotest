@@ -11,6 +11,8 @@ realm: "your-domain.example"
 max_attempts: 2
 call_duration: 15
 bye_timeout: 10
+register_before_invite: false
+register_expires: 300
 log_file: "autotest.log"
 report_json: "session-report.json"
 report_junit: "junit.xml"

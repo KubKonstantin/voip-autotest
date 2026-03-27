@@ -25,6 +25,17 @@ python3 autotest.py --config config.yaml
 
 Все этапы выполняются в рамках одной сессии (один WebSocket/SIP call flow).
 
+### Опциональный REGISTER перед INVITE
+
+Включается параметром:
+
+```yaml
+register_before_invite: true
+register_expires: 300
+```
+
+Если включено, тест сначала выполняет `REGISTER`, обрабатывает challenge (`401`/`407`) и только потом отправляет `INVITE`.
+
 ## 3) Конвертация в GitLab JUnit
 
 ```bash

@@ -11,6 +11,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 import websockets
@@ -35,6 +36,8 @@ class AppConfig:
     log_file: str = "autotest.log"
     report_json: str = "session-report.json"
     report_junit: str = "junit.xml"
+    register_before_invite: bool = False
+    register_expires: int = 300
 
 
 @dataclass
@@ -56,18 +59,60 @@ class FakeAudioTrack(MediaStreamTrack):
 
 class SIPAuthHelper:
     @staticmethod
-    def generate_proxy_auth(method: str, uri: str, nonce: str, username: str, password: str, realm: str) -> str:
-        cnonce = uuid.uuid4().hex[:12]
-        nc = "00000001"
-        qop = "auth"
+    def parse_authenticate_header(header_value: str) -> dict[str, str]:
+        clean = header_value.strip()
+        if clean.lower().startswith("digest "):
+            clean = clean[7:].strip()
+        params: dict[str, str] = {}
+        for key, value in re.findall(r'(\w+)=(".*?"|[^,]+)', clean):
+            params[key.lower()] = value.strip().strip('"')
+        return params
+
+    @staticmethod
+    def generate_digest_auth(
+        method: str,
+        uri: str,
+        username: str,
+        password: str,
+        challenge: dict[str, str],
+        nonce_count: int = 1,
+    ) -> str:
+        realm = challenge.get("realm", "")
+        nonce = challenge.get("nonce", "")
+        algorithm = challenge.get("algorithm", "MD5")
+        qop_options = challenge.get("qop", "")
+
+        if algorithm.upper() != "MD5":
+            raise RuntimeError(f"Unsupported digest algorithm: {algorithm}")
+
         ha1 = hashlib.md5(f"{username}:{realm}:{password}".encode()).hexdigest()
         ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
-        response = hashlib.md5(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()).hexdigest()
-        return (
-            'Proxy-Authorization: Digest algorithm=MD5, username="{}", '
-            'realm="{}", nonce="{}", uri="{}", response="{}", '
-            'qop={}, cnonce="{}", nc={}\r\n'.format(username, realm, nonce, uri, response, qop, cnonce, nc)
-        )
+        qop = ""
+        cnonce = ""
+        nc = f"{nonce_count:08x}"
+
+        if qop_options:
+            options = [item.strip() for item in qop_options.split(",")]
+            qop = "auth" if "auth" in options else options[0]
+            cnonce = uuid.uuid4().hex[:12]
+            response = hashlib.md5(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()).hexdigest()
+        else:
+            response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+
+        auth_fields = [
+            'username="{}"'.format(username),
+            'realm="{}"'.format(realm),
+            'nonce="{}"'.format(nonce),
+            'uri="{}"'.format(uri),
+            'response="{}"'.format(response),
+        ]
+        if challenge.get("opaque"):
+            auth_fields.append('opaque="{}"'.format(challenge["opaque"]))
+        if algorithm:
+            auth_fields.append(f"algorithm={algorithm}")
+        if qop:
+            auth_fields.extend([f"qop={qop}", 'cnonce="{}"'.format(cnonce), f"nc={nc}"])
+        return "Digest " + ", ".join(auth_fields)
 
 
 class SessionRecorder:
@@ -118,10 +163,14 @@ class WebRTCTester:
         self.cseq = 1
         self.branch = f"z9hG4bK-{uuid.uuid4()}"
         self.auth_info = None
+        self.auth_header_name = None
         self.from_tag = str(uuid.uuid4())
         self.to_tag = None
         self.websocket = None
         self.ice_connected = False
+        self.registered_contact = False
+        self.auth_nonce_counters: dict[str, int] = {}
+        self.ws_host = urlparse(self.config.opensips_ws).hostname or "autotest.local"
 
     def _setup_event_handlers(self) -> None:
         @self.pc.on("iceconnectionstatechange")
@@ -157,10 +206,31 @@ class WebRTCTester:
             self.logger.exception("FAIL: signaling_connect")
             return False
 
-    def build_sip_invite(self, offer_sdp: str, proxy_auth: str | None = None) -> str:
+    def _next_branch(self) -> str:
+        return f"z9hG4bK-{uuid.uuid4()}"
+
+    def _build_authorization_header(self, method: str, uri: str) -> str | None:
+        if not self.auth_info or not self.auth_header_name:
+            return None
+        nonce = self.auth_info.get("nonce", "")
+        nonce_key = f"{self.auth_header_name}:{nonce}"
+        nc = self.auth_nonce_counters.get(nonce_key, 0) + 1
+        self.auth_nonce_counters[nonce_key] = nc
+        digest = SIPAuthHelper.generate_digest_auth(
+            method=method,
+            uri=uri,
+            username=self.config.auth_username,
+            password=self.config.auth_password,
+            challenge=self.auth_info,
+            nonce_count=nc,
+        )
+        return f"{self.auth_header_name}: {digest}\r\n"
+
+    def build_sip_invite(self, offer_sdp: str, authorization_header: str | None = None) -> str:
+        target_uri = f"sip:{self.config.callee}"
         invite = (
             "INVITE sip:{} SIP/2.0\r\n"
-            "Via: SIP/2.0/WSS autotest.local;branch={}\r\n"
+            "Via: SIP/2.0/WSS {};branch={}\r\n"
             "Max-Forwards: 70\r\n"
             "From: <sip:{}>;tag={}\r\n"
             "To: <sip:{}>\r\n"
@@ -170,7 +240,8 @@ class WebRTCTester:
             "Content-Type: application/sdp\r\n"
         ).format(
             self.config.callee,
-            self.branch,
+            self.ws_host,
+            self._next_branch(),
             self.config.caller,
             self.from_tag,
             self.config.callee,
@@ -179,19 +250,50 @@ class WebRTCTester:
             self.config.caller,
         )
 
-        if proxy_auth:
-            invite += proxy_auth
+        if authorization_header:
+            invite += authorization_header
 
         invite += "Content-Length: {}\r\n\r\n{}".format(len(offer_sdp), offer_sdp)
         self.cseq += 1
         return invite
+
+    def build_sip_register(self, authorization_header: str | None = None) -> str:
+        request_uri = f"sip:{self.config.realm}"
+        register = (
+            "REGISTER {} SIP/2.0\r\n"
+            "Via: SIP/2.0/WSS {};branch={}\r\n"
+            "Max-Forwards: 70\r\n"
+            "From: <sip:{}>;tag={}\r\n"
+            "To: <sip:{}>\r\n"
+            "Call-ID: {}\r\n"
+            "CSeq: {} REGISTER\r\n"
+            "Contact: <sip:{};transport=ws>\r\n"
+            "Expires: {}\r\n"
+            "Content-Length: 0\r\n"
+        ).format(
+            request_uri,
+            self.ws_host,
+            self._next_branch(),
+            self.config.caller,
+            self.from_tag,
+            self.config.caller,
+            self.call_id,
+            self.cseq,
+            self.config.caller,
+            self.config.register_expires,
+        )
+        if authorization_header:
+            register += authorization_header
+        register += "\r\n"
+        self.cseq += 1
+        return register
 
     def build_sip_ack(self) -> str:
         if not self.to_tag:
             raise RuntimeError("No To tag available for ACK")
         return (
             "ACK sip:{} SIP/2.0\r\n"
-            "Via: SIP/2.0/WSS autotest.local;branch={}\r\n"
+            "Via: SIP/2.0/WSS {};branch={}\r\n"
             "Max-Forwards: 70\r\n"
             "From: <sip:{}>;tag={}\r\n"
             "To: <sip:{}>;tag={}\r\n"
@@ -200,7 +302,8 @@ class WebRTCTester:
             "Content-Length: 0\r\n\r\n"
         ).format(
             self.config.callee,
-            f"z9hG4bK-{uuid.uuid4()}",
+            self.ws_host,
+            self._next_branch(),
             self.config.caller,
             self.from_tag,
             self.config.callee,
@@ -214,7 +317,7 @@ class WebRTCTester:
             raise RuntimeError("No To tag available for BYE")
         msg = (
             "BYE sip:{} SIP/2.0\r\n"
-            "Via: SIP/2.0/WSS autotest.local;branch={}\r\n"
+            "Via: SIP/2.0/WSS {};branch={}\r\n"
             "Max-Forwards: 70\r\n"
             "From: <sip:{}>;tag={}\r\n"
             "To: <sip:{}>;tag={}\r\n"
@@ -223,7 +326,8 @@ class WebRTCTester:
             "Content-Length: 0\r\n\r\n"
         ).format(
             self.config.callee,
-            f"z9hG4bK-{uuid.uuid4()}",
+            self.ws_host,
+            self._next_branch(),
             self.config.caller,
             self.from_tag,
             self.config.callee,
@@ -267,41 +371,51 @@ class WebRTCTester:
 
         return {"status_code": status_code, "method": method, "headers": headers, "body": "\r\n".join(body_lines).strip()}
 
-    async def handle_407_response(self, response: str) -> None:
+    async def handle_auth_challenge(self, response: str) -> str:
         parsed = self.parse_sip_message(response)
-        header = parsed["headers"].get("Proxy-Authenticate", "")
+        code = parsed.get("status_code")
+        if code == 401:
+            header_name = "WWW-Authenticate"
+            auth_header_name = "Authorization"
+        elif code == 407:
+            header_name = "Proxy-Authenticate"
+            auth_header_name = "Proxy-Authorization"
+        else:
+            raise RuntimeError(f"Not an auth challenge: {code}")
+
+        header = parsed["headers"].get(header_name, "")
         if not header:
-            raise RuntimeError("407 without Proxy-Authenticate")
+            raise RuntimeError(f"{code} without {header_name}")
 
-        auth_params: dict[str, str] = {}
-        clean = header.replace("Digest ", "")
-        for part in clean.split(","):
-            if "=" in part:
-                key, value = part.strip().split("=", 1)
-                auth_params[key.strip()] = value.strip().strip('"')
-
-        self.auth_info = {
-            "realm": auth_params.get("realm", self.config.realm),
-            "nonce": auth_params.get("nonce", ""),
-            "algorithm": auth_params.get("algorithm", "MD5"),
-            "qop": auth_params.get("qop", "auth"),
-        }
+        challenge = SIPAuthHelper.parse_authenticate_header(header)
+        if challenge.get("stale", "").lower() == "true":
+            self.logger.info("INFO: stale nonce received, refreshing auth credentials")
+        self.auth_info = challenge
+        self.auth_info.setdefault("realm", self.config.realm)
+        self.auth_header_name = auth_header_name
+        return auth_header_name
 
     async def send_sip_invite(self, offer: RTCSessionDescription) -> None:
-        proxy_auth = None
-        if self.auth_info:
-            proxy_auth = SIPAuthHelper.generate_proxy_auth(
-                method="INVITE",
-                uri=f"sip:{self.config.callee}",
-                nonce=self.auth_info["nonce"],
-                username=self.config.auth_username,
-                password=self.config.auth_password,
-                realm=self.auth_info["realm"],
-            )
-        invite = self.build_sip_invite(offer.sdp, proxy_auth)
+        auth_header = self._build_authorization_header(method="INVITE", uri=f"sip:{self.config.callee}")
+        invite = self.build_sip_invite(offer.sdp, auth_header)
         await self.websocket.send(invite)
 
-    async def receive_sip_final(self) -> RTCSessionDescription | str:
+    async def send_register(self) -> bool:
+        request_uri = f"sip:{self.config.realm}"
+        attempts = 0
+        while attempts < self.config.max_attempts:
+            attempts += 1
+            auth_header = self._build_authorization_header("REGISTER", request_uri)
+            await self.websocket.send(self.build_sip_register(auth_header))
+            response = await asyncio.wait_for(self.receive_sip_response(expect_body=False), timeout=self.config.timeout)
+            if response == "AUTH_REQUIRED":
+                continue
+            if response == "OK":
+                self.registered_contact = True
+                return True
+        return False
+
+    async def receive_sip_response(self, expect_body: bool) -> RTCSessionDescription | str:
         while True:
             raw = await self.websocket.recv()
             parsed = self.parse_sip_message(raw)
@@ -310,10 +424,12 @@ class WebRTCTester:
                 continue
             if 100 <= code < 200:
                 continue
-            if code == 407:
-                await self.handle_407_response(raw)
+            if code in {401, 407}:
+                await self.handle_auth_challenge(raw)
                 return "AUTH_REQUIRED"
             if code == 200:
+                if not expect_body:
+                    return "OK"
                 to_header = parsed["headers"].get("To", "")
                 tag_match = re.search(r";tag=([^\s;]+)", to_header)
                 if tag_match:
@@ -344,6 +460,11 @@ class WebRTCTester:
         rtp_stage = self.recorder.start_stage("rtp")
 
         try:
+            if self.config.register_before_invite:
+                register_ok = await self.send_register()
+                if not register_ok:
+                    raise RuntimeError("REGISTER failed after max_attempts")
+
             self.pc.addTrack(FakeAudioTrack())
             offer = await self.pc.createOffer()
             await self.pc.setLocalDescription(offer)
@@ -353,7 +474,10 @@ class WebRTCTester:
             while attempts < self.config.max_attempts:
                 attempts += 1
                 await self.send_sip_invite(offer)
-                response = await asyncio.wait_for(self.receive_sip_final(), timeout=self.config.timeout)
+                response = await asyncio.wait_for(
+                    self.receive_sip_response(expect_body=True),
+                    timeout=self.config.timeout,
+                )
                 if response == "AUTH_REQUIRED":
                     continue
                 answer = response
@@ -365,7 +489,12 @@ class WebRTCTester:
             await self.pc.setRemoteDescription(answer)
             ack = self.build_sip_ack()
             await self.websocket.send(ack)
-            self.recorder.finish_stage(sip_stage, "passed", "INVITE/200/ACK completed in single SIP session")
+            register_mark = "REGISTER + " if self.config.register_before_invite else ""
+            self.recorder.finish_stage(
+                sip_stage,
+                "passed",
+                f"{register_mark}INVITE/200/ACK completed in single SIP session",
+            )
 
             rtp_ok, rtp_details = await self.validate_rtp_phase()
             self.recorder.finish_stage(rtp_stage, "passed" if rtp_ok else "failed", rtp_details)
