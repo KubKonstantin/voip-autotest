@@ -9,6 +9,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -58,16 +59,17 @@ class FakeAudioTrack(MediaStreamTrack):
 
     def __init__(self) -> None:
         super().__init__()
-        self.sample_rate = 8000
+        self.sample_rate = 48000
         self.samples_sent = 0
 
     async def recv(self):
         await asyncio.sleep(0.02)
-        frame = AudioFrame(format="s16", layout="mono", samples=160)
+        frame = AudioFrame(format="s16", layout="mono", samples=960)
         for plane in frame.planes:
             plane.update(b"\x00" * plane.buffer_size)
         frame.pts = self.samples_sent
         frame.sample_rate = self.sample_rate
+        frame.time_base = Fraction(1, self.sample_rate)
         self.samples_sent += frame.samples
         return frame
 
@@ -586,6 +588,7 @@ class WebRTCTester:
                 if not register_ok:
                     raise RuntimeError("REGISTER failed after max_attempts")
 
+            self.pc.addTransceiver("audio", direction="sendrecv")
             self.pc.addTrack(FakeAudioTrack())
             offer = await self.pc.createOffer()
             await self.pc.setLocalDescription(offer)
