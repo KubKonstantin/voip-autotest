@@ -1,0 +1,21 @@
+opensips_ws: "wss://your-domain.example:7443/wss"
+caller: "1001@your-domain.example"
+callee: "1002@your-domain.example"
+timeout: 30
+origin: "https://your-domain.example"
+subprotocols:
+  - "sip"
+auth_username: "1001"
+auth_password: "change_me"
+realm: "your-domain.example"
+max_attempts: 2
+call_duration: 15
+bye_timeout: 10
+register_before_invite: false
+register_expires: 300
+session_expires: 1800
+min_se: 90
+refresher: "uac"
+log_file: "autotest.log"
+report_json: "session-report.json"
+report_junit: "junit.xml"
