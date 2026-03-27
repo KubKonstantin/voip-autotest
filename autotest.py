@@ -17,6 +17,7 @@ import yaml
 import websockets
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamTrack
+from av import AudioFrame
 
 
 @dataclass
@@ -38,6 +39,9 @@ class AppConfig:
     report_junit: str = "junit.xml"
     register_before_invite: bool = False
     register_expires: int = 300
+    session_expires: int = 1800
+    min_se: int = 90
+    refresher: str = "uac"
 
 
 @dataclass
@@ -52,9 +56,21 @@ class StageResult:
 class FakeAudioTrack(MediaStreamTrack):
     kind = "audio"
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.sample_rate = 8000
+        self.samples_sent = 0
+
     async def recv(self):
         await asyncio.sleep(0.02)
-        return None
+        frame = AudioFrame(format="s16", layout="mono", samples=160)
+        for plane in frame.planes:
+            plane.update(b"\x00" * plane.buffer_size)
+        frame.pts = self.samples_sent
+        frame.sample_rate = self.sample_rate
+        self.samples_sent += frame.samples
+        return frame
+
 
 
 class SIPAuthHelper:
@@ -237,6 +253,9 @@ class WebRTCTester:
             "Call-ID: {}\r\n"
             "CSeq: {} INVITE\r\n"
             "Contact: <sip:{};transport=ws>\r\n"
+            "Supported: timer,ice,outbound\r\n"
+            "Session-Expires: {};refresher={}\r\n"
+            "Min-SE: {}\r\n"
             "Content-Type: application/sdp\r\n"
         ).format(
             self.config.callee,
@@ -248,6 +267,9 @@ class WebRTCTester:
             self.call_id,
             self.cseq,
             self.config.caller,
+            self.config.session_expires,
+            self.config.refresher,
+            self.config.min_se,
         )
 
         if authorization_header:

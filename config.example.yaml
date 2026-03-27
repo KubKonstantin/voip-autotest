@@ -13,6 +13,9 @@ call_duration: 15
 bye_timeout: 10
 register_before_invite: false
 register_expires: 300
+session_expires: 1800
+min_se: 90
+refresher: "uac"
 log_file: "autotest.log"
 report_json: "session-report.json"
 report_junit: "junit.xml"
