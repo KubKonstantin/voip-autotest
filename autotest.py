@@ -338,6 +338,37 @@ class WebRTCTester:
         self.cseq += 1
         return msg
 
+    def build_simple_response(self, request: dict[str, Any], status: str) -> str:
+        headers = request.get("headers", {})
+        return (
+            f"SIP/2.0 {status}\r\n"
+            f"Via: {headers.get('Via', '')}\r\n"
+            f"From: {headers.get('From', '')}\r\n"
+            f"To: {headers.get('To', '')}\r\n"
+            f"Call-ID: {headers.get('Call-ID', self.call_id)}\r\n"
+            f"CSeq: {headers.get('CSeq', '')}\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+
+    def build_reinvite_ok(self, request: dict[str, Any]) -> str:
+        headers = request.get("headers", {})
+        answer_sdp = ""
+        if self.pc.localDescription and self.pc.localDescription.sdp:
+            answer_sdp = self.pc.localDescription.sdp
+
+        content_type = "Content-Type: application/sdp\r\n" if answer_sdp else ""
+        return (
+            "SIP/2.0 200 OK\r\n"
+            f"Via: {headers.get('Via', '')}\r\n"
+            f"From: {headers.get('From', '')}\r\n"
+            f"To: {headers.get('To', '')}\r\n"
+            f"Call-ID: {headers.get('Call-ID', self.call_id)}\r\n"
+            f"CSeq: {headers.get('CSeq', '')}\r\n"
+            f"{content_type}"
+            f"Content-Length: {len(answer_sdp)}\r\n\r\n"
+            f"{answer_sdp}"
+        )
+
     def parse_sip_message(self, raw: str) -> dict[str, Any]:
         normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
         lines = normalized.split("\n")
@@ -563,24 +594,38 @@ class WebRTCTester:
                 rtp_ok, rtp_details = await self.validate_rtp_phase()
                 self.recorder.finish_stage(rtp_stage, "passed" if rtp_ok else "failed", rtp_details)
 
-            try:
-                msg = await asyncio.wait_for(self.websocket.recv(), timeout=self.config.call_duration)
-                parsed = self.parse_sip_message(msg)
-                if parsed.get("method") == "BYE":
-                    ok = (
-                        "SIP/2.0 200 OK\r\n"
-                        f"Via: {parsed['headers'].get('Via', '')}\r\n"
-                        f"From: {parsed['headers'].get('From', '')}\r\n"
-                        f"To: {parsed['headers'].get('To', '')}\r\n"
-                        f"Call-ID: {parsed['headers'].get('Call-ID', self.call_id)}\r\n"
-                        f"CSeq: {parsed['headers'].get('CSeq', '1 BYE')}\r\n"
-                        "Content-Length: 0\r\n\r\n"
-                    )
-                    await self.websocket.send(ok)
-                else:
+            call_deadline = asyncio.get_running_loop().time() + self.config.call_duration
+            while True:
+                remaining = call_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
                     await self.websocket.send(self.build_sip_bye())
-            except asyncio.TimeoutError:
-                await self.websocket.send(self.build_sip_bye())
+                    break
+
+                try:
+                    msg = await asyncio.wait_for(self.websocket.recv(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    await self.websocket.send(self.build_sip_bye())
+                    break
+
+                parsed = self.parse_sip_message(msg)
+                method = parsed.get("method")
+                if method == "BYE":
+                    await self.websocket.send(self.build_simple_response(parsed, "200 OK"))
+                    break
+                if method == "INVITE":
+                    # Re-INVITE: подтверждаем диалог и НЕ рвем звонок.
+                    await self.websocket.send(self.build_reinvite_ok(parsed))
+                    continue
+                if method == "ACK":
+                    continue
+                if method == "UPDATE":
+                    await self.websocket.send(self.build_simple_response(parsed, "200 OK"))
+                    continue
+                if method == "OPTIONS":
+                    await self.websocket.send(self.build_simple_response(parsed, "200 OK"))
+                    continue
+                # Для незнакомых in-dialog запросов не прерываем сессию.
+                await self.websocket.send(self.build_simple_response(parsed, "501 Not Implemented"))
 
         except Exception as exc:
             if self.recorder.stages[sip_stage].status == "running":
