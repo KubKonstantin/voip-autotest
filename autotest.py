@@ -72,6 +72,7 @@ class FakeAudioTrack(MediaStreamTrack):
         return frame
 
 
+
 class SIPAuthHelper:
     @staticmethod
     def parse_authenticate_header(header_value: str) -> dict[str, str]:
