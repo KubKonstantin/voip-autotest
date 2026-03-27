@@ -339,7 +339,8 @@ class WebRTCTester:
         return msg
 
     def parse_sip_message(self, raw: str) -> dict[str, Any]:
-        lines = raw.split("\r\n")
+        normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+        lines = normalized.split("\n")
         if not lines or not lines[0]:
             raise ValueError("empty SIP message")
         start = lines[0]
@@ -351,7 +352,7 @@ class WebRTCTester:
                 raise ValueError(f"invalid status line: {start}")
             status_code = int(m.group(1))
         else:
-            m = re.match(r"([A-Z]+) sip:.+ SIP/2\.0", start)
+            m = re.match(r"([A-Z]+)\s+\S+\s+SIP/2\.0", start)
             if not m:
                 raise ValueError(f"invalid request line: {start}")
             method = m.group(1)
@@ -370,6 +371,32 @@ class WebRTCTester:
                 body_lines.append(line)
 
         return {"status_code": status_code, "method": method, "headers": headers, "body": "\r\n".join(body_lines).strip()}
+
+    def sanitize_sdp(self, sdp: str) -> str:
+        lines: list[str] = []
+        for raw_line in sdp.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line = raw_line.strip()
+            if not line or "=" not in line:
+                continue
+            if line.startswith("m="):
+                media = line[2:].split()
+                if len(media) < 4:
+                    if media and media[0] == "audio":
+                        line = "m=audio 9 UDP/TLS/RTP/SAVPF 111"
+                    else:
+                        continue
+            lines.append(line)
+
+        present = {line[0] for line in lines if "=" in line}
+        if "v" not in present:
+            lines.insert(0, "v=0")
+        if "o" not in present:
+            lines.insert(1, f"o=- {uuid.uuid4().hex[:10]} 0 IN IP4 0.0.0.0")
+        if "s" not in present:
+            lines.insert(2, "s=-")
+        if "t" not in present:
+            lines.insert(3, "t=0 0")
+        return "\r\n".join(lines) + "\r\n"
 
     async def handle_auth_challenge(self, response: str) -> str:
         parsed = self.parse_sip_message(response)
@@ -436,7 +463,10 @@ class WebRTCTester:
                     self.to_tag = tag_match.group(1)
                 if not parsed["body"]:
                     raise RuntimeError("200 OK without SDP")
-                return RTCSessionDescription(sdp=parsed["body"], type="answer")
+                sanitized_sdp = self.sanitize_sdp(parsed["body"])
+                if sanitized_sdp.strip() != parsed["body"].strip():
+                    self.logger.info("INFO: remote SDP normalized before aiortc parsing")
+                return RTCSessionDescription(sdp=sanitized_sdp, type="answer")
             raise RuntimeError(f"SIP final error: {code}")
 
     async def validate_rtp_phase(self) -> tuple[bool, str]:
