@@ -50,6 +50,8 @@ refresher: "uac"
 reinvite_policy: "reject" # accept|reject
 sip_trace: true
 rtp_probe_seconds: 3
+offer_telephone_event: true
+telephone_event_payload: 101
 ```
 
 Также тест теперь отправляет реальный silence RTP-поток (а не пустой `None`), что уменьшает шанс серверного media re-INVITE.
@@ -57,6 +59,7 @@ rtp_probe_seconds: 3
 Если нужно жестко блокировать re-INVITE от PBX, используйте `reinvite_policy: "reject"` (ответ `488`).
 `rtp_probe_seconds` — пауза перед проверкой RTP-статистики `aiortc` (`packetsSent/packetsReceived` для аудио).
 Перед отправкой INVITE клиент ожидает завершение ICE gathering, чтобы SDP ушел с кандидатами.
+Если нужно DTMF по RFC2833/4733, включите `offer_telephone_event: true` — в SDP offer будет добавлен `telephone-event/8000` (payload по `telephone_event_payload`).
 
 ## 3) Конвертация в GitLab JUnit
 

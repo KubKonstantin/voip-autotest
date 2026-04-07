@@ -48,6 +48,8 @@ class AppConfig:
     reinvite_policy: str = "reject"
     sip_trace: bool = True
     rtp_probe_seconds: int = 3
+    offer_telephone_event: bool = True
+    telephone_event_payload: int = 101
 
 
 @dataclass
@@ -535,6 +537,48 @@ class WebRTCTester:
             lines.insert(3, "t=0 0")
         return "\r\n".join(lines) + "\r\n"
 
+    def add_telephone_event_to_sdp(self, sdp: str) -> str:
+        if not self.config.offer_telephone_event:
+            return sdp
+
+        payload = str(self.config.telephone_event_payload)
+        lines = sdp.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        out: list[str] = []
+        in_audio = False
+        audio_section_done = False
+        rtpmap_present = False
+        fmtp_present = False
+
+        for line in lines:
+            if line.startswith("m="):
+                if in_audio and not audio_section_done:
+                    if not rtpmap_present:
+                        out.append(f"a=rtpmap:{payload} telephone-event/8000")
+                    if not fmtp_present:
+                        out.append(f"a=fmtp:{payload} 0-16")
+                    audio_section_done = True
+                in_audio = line.startswith("m=audio ")
+                if in_audio:
+                    parts = line.split()
+                    if payload not in parts[3:]:
+                        line = line + f" {payload}"
+                out.append(line)
+                continue
+
+            if in_audio and line.startswith(f"a=rtpmap:{payload} "):
+                rtpmap_present = True
+            if in_audio and line.startswith(f"a=fmtp:{payload} "):
+                fmtp_present = True
+            out.append(line)
+
+        if in_audio and not audio_section_done:
+            if not rtpmap_present:
+                out.append(f"a=rtpmap:{payload} telephone-event/8000")
+            if not fmtp_present:
+                out.append(f"a=fmtp:{payload} 0-16")
+
+        return "\r\n".join([line for line in out if line.strip()]) + "\r\n"
+
     async def handle_auth_challenge(self, response: str) -> str:
         parsed = self.parse_sip_message(response)
         code = parsed.get("status_code")
@@ -561,7 +605,8 @@ class WebRTCTester:
 
     async def send_sip_invite(self, offer: RTCSessionDescription) -> None:
         auth_header = self._build_authorization_header(method="INVITE", uri=f"sip:{self.config.callee}")
-        invite = self.build_sip_invite(offer.sdp, auth_header)
+        offer_sdp = self.add_telephone_event_to_sdp(offer.sdp)
+        invite = self.build_sip_invite(offer_sdp, auth_header)
         await self.send_sip(invite)
 
     async def send_register(self) -> bool:
