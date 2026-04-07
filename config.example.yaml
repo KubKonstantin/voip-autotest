@@ -13,9 +13,12 @@ call_duration: 15
 bye_timeout: 10
 register_before_invite: false
 register_expires: 300
+enable_session_timer: false
 session_expires: 1800
 min_se: 90
 refresher: "uac"
+reinvite_policy: "reject" # accept|reject
+sip_trace: true
 log_file: "autotest.log"
 report_json: "session-report.json"
 report_junit: "junit.xml"

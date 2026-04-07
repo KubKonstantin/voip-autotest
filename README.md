@@ -41,12 +41,17 @@ register_expires: 300
 В INVITE добавлены Session-Timer заголовки, чтобы инициатором refresh был клиент:
 
 ```yaml
+enable_session_timer: false
 session_expires: 1800
 min_se: 90
 refresher: "uac"
+reinvite_policy: "reject" # accept|reject
+sip_trace: true
 ```
 
 Также тест теперь отправляет реальный silence RTP-поток (а не пустой `None`), что уменьшает шанс серверного media re-INVITE.
+При `sip_trace: true` все входящие/исходящие SIP сообщения пишутся в `autotest.log`.
+Если нужно жестко блокировать re-INVITE от PBX, используйте `reinvite_policy: "reject"` (ответ `488`).
 
 ## 3) Конвертация в GitLab JUnit
 

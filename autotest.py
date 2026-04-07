@@ -40,9 +40,12 @@ class AppConfig:
     report_junit: str = "junit.xml"
     register_before_invite: bool = False
     register_expires: int = 300
+    enable_session_timer: bool = False
     session_expires: int = 1800
     min_se: int = 90
     refresher: str = "uac"
+    reinvite_policy: str = "reject"
+    sip_trace: bool = True
 
 
 @dataclass
@@ -189,6 +192,20 @@ class WebRTCTester:
         self.auth_nonce_counters: dict[str, int] = {}
         self.ws_host = urlparse(self.config.opensips_ws).hostname or "autotest.local"
 
+    def log_sip(self, direction: str, message: str) -> None:
+        if not self.config.sip_trace:
+            return
+        self.logger.info("SIP %s >>>\n%s\n<<< SIP %s", direction, message, direction)
+
+    async def send_sip(self, message: str) -> None:
+        self.log_sip("OUT", message)
+        await self.websocket.send(message)
+
+    async def recv_sip(self) -> str:
+        message = await self.websocket.recv()
+        self.log_sip("IN", message)
+        return message
+
     def _setup_event_handlers(self) -> None:
         @self.pc.on("iceconnectionstatechange")
         async def on_iceconnectionstatechange() -> None:
@@ -254,9 +271,7 @@ class WebRTCTester:
             "Call-ID: {}\r\n"
             "CSeq: {} INVITE\r\n"
             "Contact: <sip:{};transport=ws>\r\n"
-            "Supported: timer,ice,outbound\r\n"
-            "Session-Expires: {};refresher={}\r\n"
-            "Min-SE: {}\r\n"
+            "Supported: ice,outbound\r\n"
             "Content-Type: application/sdp\r\n"
         ).format(
             self.config.callee,
@@ -268,10 +283,13 @@ class WebRTCTester:
             self.call_id,
             self.cseq,
             self.config.caller,
-            self.config.session_expires,
-            self.config.refresher,
-            self.config.min_se,
         )
+        if self.config.enable_session_timer:
+            invite += (
+                "Supported: timer,ice,outbound\r\n"
+                "Session-Expires: {};refresher={}\r\n"
+                "Min-SE: {}\r\n"
+            ).format(self.config.session_expires, self.config.refresher, self.config.min_se)
 
         if authorization_header:
             invite += authorization_header
@@ -510,7 +528,7 @@ class WebRTCTester:
     async def send_sip_invite(self, offer: RTCSessionDescription) -> None:
         auth_header = self._build_authorization_header(method="INVITE", uri=f"sip:{self.config.callee}")
         invite = self.build_sip_invite(offer.sdp, auth_header)
-        await self.websocket.send(invite)
+        await self.send_sip(invite)
 
     async def send_register(self) -> bool:
         request_uri = f"sip:{self.config.realm}"
@@ -518,7 +536,7 @@ class WebRTCTester:
         while attempts < self.config.max_attempts:
             attempts += 1
             auth_header = self._build_authorization_header("REGISTER", request_uri)
-            await self.websocket.send(self.build_sip_register(auth_header))
+            await self.send_sip(self.build_sip_register(auth_header))
             response = await asyncio.wait_for(self.receive_sip_response(expect_body=False), timeout=self.config.timeout)
             if response == "AUTH_REQUIRED":
                 continue
@@ -529,7 +547,7 @@ class WebRTCTester:
 
     async def receive_sip_response(self, expect_body: bool) -> RTCSessionDescription | str:
         while True:
-            raw = await self.websocket.recv()
+            raw = await self.recv_sip()
             parsed = self.parse_sip_message(raw)
             code = parsed["status_code"]
             if code is None:
@@ -625,7 +643,7 @@ class WebRTCTester:
                 )
 
             ack = self.build_sip_ack()
-            await self.websocket.send(ack)
+            await self.send_sip(ack)
             register_mark = "REGISTER + " if self.config.register_before_invite else ""
             self.recorder.finish_stage(
                 sip_stage,
@@ -641,35 +659,38 @@ class WebRTCTester:
             while True:
                 remaining = call_deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
-                    await self.websocket.send(self.build_sip_bye())
+                    await self.send_sip(self.build_sip_bye())
                     break
 
                 try:
-                    msg = await asyncio.wait_for(self.websocket.recv(), timeout=remaining)
+                    msg = await asyncio.wait_for(self.recv_sip(), timeout=remaining)
                 except asyncio.TimeoutError:
-                    await self.websocket.send(self.build_sip_bye())
+                    await self.send_sip(self.build_sip_bye())
                     break
 
                 parsed = self.parse_sip_message(msg)
                 method = parsed.get("method")
                 if method == "BYE":
-                    await self.websocket.send(self.build_simple_response(parsed, "200 OK"))
+                    await self.send_sip(self.build_simple_response(parsed, "200 OK"))
                     break
                 if method == "INVITE":
                     # Re-INVITE: подтверждаем диалог и НЕ рвем звонок.
-                    reinvite_ok = await self.handle_reinvite(parsed)
-                    await self.websocket.send(reinvite_ok)
+                    if self.config.reinvite_policy == "accept":
+                        reinvite_ok = await self.handle_reinvite(parsed)
+                        await self.send_sip(reinvite_ok)
+                    else:
+                        await self.send_sip(self.build_simple_response(parsed, "488 Not Acceptable Here"))
                     continue
                 if method == "ACK":
                     continue
                 if method == "UPDATE":
-                    await self.websocket.send(self.build_simple_response(parsed, "200 OK"))
+                    await self.send_sip(self.build_simple_response(parsed, "200 OK"))
                     continue
                 if method == "OPTIONS":
-                    await self.websocket.send(self.build_simple_response(parsed, "200 OK"))
+                    await self.send_sip(self.build_simple_response(parsed, "200 OK"))
                     continue
                 # Для незнакомых in-dialog запросов не прерываем сессию.
-                await self.websocket.send(self.build_simple_response(parsed, "501 Not Implemented"))
+                await self.send_sip(self.build_simple_response(parsed, "501 Not Implemented"))
 
         except Exception as exc:
             if self.recorder.stages[sip_stage].status == "running":
