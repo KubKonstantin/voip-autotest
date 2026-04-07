@@ -1,21 +1,51 @@
+import argparse
+import json
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 
-def convert_log_to_junit(log_file, output_file):
-    root = ET.Element("testsuite", name="TestSuite", timestamp=datetime.now().isoformat())
-    
-    with open(log_file, 'r') as f:
-        for line in f:
-            if "PASS" in line:
-                test_case = ET.SubElement(root, "testcase", name=line.strip())
-            elif "FAIL" in line:
-                test_case = ET.SubElement(root, "testcase", name=line.strip())
-                ET.SubElement(test_case, "failure", message="Test failed")
-            elif "ERROR" in line:
-                test_case = ET.SubElement(root, "testcase", name=line.strip())
-                ET.SubElement(test_case, "error", message="Test error")
-    
-    tree = ET.ElementTree(root)
-    tree.write(output_file, encoding='utf-8', xml_declaration=True)
 
-convert_log_to_junit("autotest.log", "junit.xml")
+def convert_session_json_to_junit(report_json: str, output_xml: str) -> None:
+    report = json.loads(Path(report_json).read_text(encoding="utf-8"))
+    stages = report.get("stages", [])
+
+    tests = len(stages)
+    failures = sum(1 for s in stages if s.get("status") != "passed")
+
+    suite = ET.Element(
+        "testsuite",
+        name="voip-autotest",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        tests=str(tests),
+        failures=str(failures),
+        errors="0",
+    )
+
+    for stage in stages:
+        case = ET.SubElement(
+            suite,
+            "testcase",
+            classname="voip.session",
+            name=stage.get("name", "unknown"),
+        )
+        status = stage.get("status", "failed")
+        details = stage.get("details", "")
+        if status != "passed":
+            failure = ET.SubElement(case, "failure", message="stage failed")
+            failure.text = details
+        else:
+            ET.SubElement(case, "system-out").text = details
+
+    ET.ElementTree(suite).write(output_xml, encoding="utf-8", xml_declaration=True)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Convert session JSON report to GitLab-compatible JUnit XML")
+    parser.add_argument("--input", required=True, help="Path to session-report.json")
+    parser.add_argument("--output", required=True, help="Path to junit.xml")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    convert_session_json_to_junit(args.input, args.output)
