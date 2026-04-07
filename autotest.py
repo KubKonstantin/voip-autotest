@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 import yaml
 import websockets
-from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
+from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamTrack
 from av import AudioFrame
 
@@ -29,6 +29,7 @@ class AppConfig:
     timeout: int
     origin: str
     subprotocols: list[str]
+    ice_servers: list[dict[str, Any] | str] | None = None
     auth_username: str
     auth_password: str
     realm: str
@@ -46,6 +47,7 @@ class AppConfig:
     refresher: str = "uac"
     reinvite_policy: str = "reject"
     sip_trace: bool = True
+    rtp_probe_seconds: int = 3
 
 
 @dataclass
@@ -175,7 +177,23 @@ class WebRTCTester:
         self.logger = logger
         self.recorder = recorder
 
-        rtc_config = RTCConfiguration(iceServers=[])
+        rtc_servers: list[RTCIceServer] = []
+        for item in self.config.ice_servers or []:
+            if isinstance(item, str):
+                rtc_servers.append(RTCIceServer(urls=[item]))
+            elif isinstance(item, dict):
+                urls = item.get("urls", [])
+                if isinstance(urls, str):
+                    urls = [urls]
+                rtc_servers.append(
+                    RTCIceServer(
+                        urls=urls,
+                        username=item.get("username"),
+                        credential=item.get("credential"),
+                    )
+                )
+
+        rtc_config = RTCConfiguration(iceServers=rtc_servers)
         self.pc = RTCPeerConnection(configuration=rtc_config)
         self._setup_event_handlers()
 
@@ -214,6 +232,20 @@ class WebRTCTester:
             self.logger.info("ICE state: %s", state)
             if state in {"connected", "completed"}:
                 self.ice_connected = True
+
+        @self.pc.on("icegatheringstatechange")
+        async def on_icegatheringstatechange() -> None:
+            self.logger.info("ICE gathering state: %s", self.pc.iceGatheringState)
+
+    async def wait_for_ice_gathering(self, timeout: int = 10) -> None:
+        if self.pc.iceGatheringState == "complete":
+            return
+        deadline = asyncio.get_running_loop().time() + timeout
+        while self.pc.iceGatheringState != "complete":
+            if asyncio.get_running_loop().time() > deadline:
+                self.logger.warning("FAIL: ICE gathering timeout, continuing with current SDP")
+                return
+            await asyncio.sleep(0.1)
 
     async def _create_ssl_context(self) -> ssl.SSLContext:
         ssl_context = ssl.create_default_context()
@@ -599,11 +631,38 @@ class WebRTCTester:
         sdp = self.pc.remoteDescription.sdp
         has_audio_media = "m=audio" in sdp
         has_rtcp_mux = "a=rtcp-mux" in sdp
-        if has_audio_media and has_rtcp_mux:
-            if self.ice_connected:
-                return True, "Audio m-line + rtcp-mux present, ICE connected"
-            return True, "Audio m-line + rtcp-mux present (RTP negotiated in same session)"
-        return False, "Remote SDP lacks RTP requirements (m=audio and a=rtcp-mux)"
+        if not (has_audio_media and has_rtcp_mux):
+            return False, "Remote SDP lacks RTP requirements (m=audio and a=rtcp-mux)"
+
+        if self.config.rtp_probe_seconds > 0:
+            await asyncio.sleep(self.config.rtp_probe_seconds)
+
+        stats = await self.pc.getStats()
+        outbound_packets = 0
+        inbound_packets = 0
+        outbound_bytes = 0
+        inbound_bytes = 0
+
+        for report in stats.values():
+            report_type = getattr(report, "type", "")
+            kind = getattr(report, "kind", "")
+            if report_type == "outbound-rtp" and kind == "audio":
+                outbound_packets += int(getattr(report, "packetsSent", 0) or 0)
+                outbound_bytes += int(getattr(report, "bytesSent", 0) or 0)
+            if report_type == "inbound-rtp" and kind == "audio":
+                inbound_packets += int(getattr(report, "packetsReceived", 0) or 0)
+                inbound_bytes += int(getattr(report, "bytesReceived", 0) or 0)
+
+        details = (
+            f"RTP stats audio: outbound_packets={outbound_packets}, outbound_bytes={outbound_bytes}, "
+            f"inbound_packets={inbound_packets}, inbound_bytes={inbound_bytes}, ice_connected={self.ice_connected}"
+        )
+        self.logger.info("INFO: %s", details)
+
+        # Для прохождения достаточно видеть исходящий RTP; входящий зависит от удаленной стороны.
+        if outbound_packets > 0:
+            return True, details
+        return False, details
 
     def validate_rtp_from_raw_sdp(self, sdp: str) -> tuple[bool, str]:
         normalized = self.sanitize_sdp(sdp)
@@ -630,6 +689,8 @@ class WebRTCTester:
             self.pc.addTrack(FakeAudioTrack())
             offer = await self.pc.createOffer()
             await self.pc.setLocalDescription(offer)
+            await self.wait_for_ice_gathering(timeout=self.config.timeout)
+            offer = self.pc.localDescription or offer
 
             attempts = 0
             answer: RTCSessionDescription | None = None

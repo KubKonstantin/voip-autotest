@@ -5,6 +5,8 @@ timeout: 30
 origin: "https://your-domain.example"
 subprotocols:
   - "sip"
+ice_servers:
+  - "stun:stun.l.google.com:19302"
 auth_username: "1001"
 auth_password: "change_me"
 realm: "your-domain.example"
@@ -19,6 +21,7 @@ min_se: 90
 refresher: "uac"
 reinvite_policy: "reject" # accept|reject
 sip_trace: true
+rtp_probe_seconds: 3
 log_file: "autotest.log"
 report_json: "session-report.json"
 report_junit: "junit.xml"

@@ -11,6 +11,7 @@ cp config.example.yaml config.yaml
 ```
 
 Заполните `config.yaml` своими параметрами SIP/WebSocket.
+Для RTP обязательно укажите рабочие ICE-серверы (`ice_servers`) для вашей сети/PBX.
 
 ## 2) Запуск теста
 
@@ -48,11 +49,14 @@ min_se: 90
 refresher: "uac"
 reinvite_policy: "reject" # accept|reject
 sip_trace: true
+rtp_probe_seconds: 3
 ```
 
 Также тест теперь отправляет реальный silence RTP-поток (а не пустой `None`), что уменьшает шанс серверного media re-INVITE.
 При `sip_trace: true` все входящие/исходящие SIP сообщения пишутся в `autotest.log`.
 Если нужно жестко блокировать re-INVITE от PBX, используйте `reinvite_policy: "reject"` (ответ `488`).
+`rtp_probe_seconds` — пауза перед проверкой RTP-статистики `aiortc` (`packetsSent/packetsReceived` для аудио).
+Перед отправкой INVITE клиент ожидает завершение ICE gathering, чтобы SDP ушел с кандидатами.
 
 ## 3) Конвертация в GitLab JUnit
 
