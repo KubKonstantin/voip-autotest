@@ -29,13 +29,13 @@ class AppConfig:
     timeout: int
     origin: str
     subprotocols: list[str]
-    ice_servers: list[dict[str, Any] | str] | None = None
     auth_username: str
     auth_password: str
     realm: str
     max_attempts: int
     call_duration: int
     bye_timeout: int
+    ice_servers: list[dict[str, Any] | str] | None = None
     log_file: str = "autotest.log"
     report_json: str = "session-report.json"
     report_junit: str = "junit.xml"
