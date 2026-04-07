@@ -179,7 +179,8 @@ class WebRTCTester:
         self.pc = RTCPeerConnection(configuration=rtc_config)
         self._setup_event_handlers()
 
-        self.call_id = f"{uuid.uuid4()}@autotest.local"
+        self.invite_call_id = f"{uuid.uuid4()}@autotest.local"
+        self.register_call_id = f"{uuid.uuid4()}@autotest.local"
         self.cseq = 1
         self.branch = f"z9hG4bK-{uuid.uuid4()}"
         self.auth_info = None
@@ -280,7 +281,7 @@ class WebRTCTester:
             self.config.caller,
             self.from_tag,
             self.config.callee,
-            self.call_id,
+            self.invite_call_id,
             self.cseq,
             self.config.caller,
         )
@@ -298,8 +299,9 @@ class WebRTCTester:
         self.cseq += 1
         return invite
 
-    def build_sip_register(self, authorization_header: str | None = None) -> str:
+    def build_sip_register(self, authorization_header: str | None = None, expires: int | None = None) -> str:
         request_uri = f"sip:{self.config.realm}"
+        register_expires = self.config.register_expires if expires is None else expires
         register = (
             "REGISTER {} SIP/2.0\r\n"
             "Via: SIP/2.0/WSS {};branch={}\r\n"
@@ -318,10 +320,10 @@ class WebRTCTester:
             self.config.caller,
             self.from_tag,
             self.config.caller,
-            self.call_id,
+            self.register_call_id,
             self.cseq,
             self.config.caller,
-            self.config.register_expires,
+            register_expires,
         )
         if authorization_header:
             register += authorization_header
@@ -349,7 +351,7 @@ class WebRTCTester:
             self.from_tag,
             self.config.callee,
             self.to_tag,
-            self.call_id,
+            self.invite_call_id,
             self.cseq - 1,
         )
 
@@ -373,7 +375,7 @@ class WebRTCTester:
             self.from_tag,
             self.config.callee,
             self.to_tag,
-            self.call_id,
+            self.invite_call_id,
             self.cseq,
         )
         self.cseq += 1
@@ -386,7 +388,7 @@ class WebRTCTester:
             f"Via: {headers.get('Via', '')}\r\n"
             f"From: {headers.get('From', '')}\r\n"
             f"To: {headers.get('To', '')}\r\n"
-            f"Call-ID: {headers.get('Call-ID', self.call_id)}\r\n"
+            f"Call-ID: {headers.get('Call-ID', self.invite_call_id)}\r\n"
             f"CSeq: {headers.get('CSeq', '')}\r\n"
             "Content-Length: 0\r\n\r\n"
         )
@@ -399,7 +401,7 @@ class WebRTCTester:
             f"Via: {headers.get('Via', '')}\r\n"
             f"From: {headers.get('From', '')}\r\n"
             f"To: {headers.get('To', '')}\r\n"
-            f"Call-ID: {headers.get('Call-ID', self.call_id)}\r\n"
+            f"Call-ID: {headers.get('Call-ID', self.invite_call_id)}\r\n"
             f"CSeq: {headers.get('CSeq', '')}\r\n"
             f"{content_type}"
             f"Content-Length: {len(answer_sdp)}\r\n\r\n"
@@ -536,7 +538,7 @@ class WebRTCTester:
         while attempts < self.config.max_attempts:
             attempts += 1
             auth_header = self._build_authorization_header("REGISTER", request_uri)
-            await self.send_sip(self.build_sip_register(auth_header))
+            await self.send_sip(self.build_sip_register(auth_header, expires=self.config.register_expires))
             response = await asyncio.wait_for(self.receive_sip_response(expect_body=False), timeout=self.config.timeout)
             if response == "AUTH_REQUIRED":
                 continue
@@ -544,6 +546,24 @@ class WebRTCTester:
                 self.registered_contact = True
                 return True
         return False
+
+    async def send_unregister(self) -> None:
+        if not self.registered_contact:
+            return
+        request_uri = f"sip:{self.config.realm}"
+        attempts = 0
+        while attempts < self.config.max_attempts:
+            attempts += 1
+            auth_header = self._build_authorization_header("REGISTER", request_uri)
+            await self.send_sip(self.build_sip_register(auth_header, expires=0))
+            response = await asyncio.wait_for(self.receive_sip_response(expect_body=False), timeout=self.config.timeout)
+            if response == "AUTH_REQUIRED":
+                continue
+            if response == "OK":
+                self.logger.info("PASS: Unregister (REGISTER Expires: 0) completed")
+                self.registered_contact = False
+                return
+        self.logger.warning("FAIL: Unregister did not complete after max attempts")
 
     async def receive_sip_response(self, expect_body: bool) -> RTCSessionDescription | str:
         while True:
@@ -699,6 +719,11 @@ class WebRTCTester:
                 self.recorder.finish_stage(rtp_stage, "failed", f"RTP check skipped: {exc}")
             raise
         finally:
+            try:
+                if self.config.register_before_invite:
+                    await self.send_unregister()
+            except Exception:
+                self.logger.exception("FAIL: Unregister step failed")
             await self.close_connections()
 
     async def close_connections(self) -> None:
