@@ -9,7 +9,6 @@ import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from fractions import Fraction
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -17,8 +16,7 @@ from urllib.parse import urlparse
 import yaml
 import websockets
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
-from aiortc.mediastreams import MediaStreamTrack
-from av import AudioFrame
+from aiortc.mediastreams import AudioStreamTrack
 
 
 @dataclass
@@ -50,6 +48,7 @@ class AppConfig:
     rtp_probe_seconds: int = 3
     offer_telephone_event: bool = True
     telephone_event_payload: int = 101
+    allow_sdp_fallback: bool = False
 
 
 @dataclass
@@ -59,27 +58,6 @@ class StageResult:
     details: str
     started_at: str
     finished_at: str
-
-
-class FakeAudioTrack(MediaStreamTrack):
-    kind = "audio"
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.sample_rate = 48000
-        self.samples_sent = 0
-
-    async def recv(self):
-        await asyncio.sleep(0.02)
-        frame = AudioFrame(format="s16", layout="mono", samples=960)
-        for plane in frame.planes:
-            plane.update(b"\x00" * plane.buffer_size)
-        frame.pts = self.samples_sent
-        frame.sample_rate = self.sample_rate
-        frame.time_base = Fraction(1, self.sample_rate)
-        self.samples_sent += frame.samples
-        return frame
-
 
 class SIPAuthHelper:
     @staticmethod
@@ -447,8 +425,8 @@ class WebRTCTester:
         if not body:
             return self.build_reinvite_ok(request, "")
 
-        sanitized_offer = self.sanitize_sdp(body)
-        await self.pc.setRemoteDescription(RTCSessionDescription(sdp=sanitized_offer, type="offer"))
+        normalized_offer = self.normalize_sdp(body)
+        await self.pc.setRemoteDescription(RTCSessionDescription(sdp=normalized_offer, type="offer"))
         answer = await self.pc.createAnswer()
         await self.pc.setLocalDescription(answer)
         return self.build_reinvite_ok(request, self.pc.localDescription.sdp if self.pc.localDescription else "")
@@ -535,6 +513,10 @@ class WebRTCTester:
             lines.insert(2, "s=-")
         if "t" not in present:
             lines.insert(3, "t=0 0")
+        return "\r\n".join(lines) + "\r\n"
+
+    def normalize_sdp(self, sdp: str) -> str:
+        lines = [line.strip() for line in sdp.replace("\r\n", "\n").replace("\r", "\n").split("\n") if line.strip()]
         return "\r\n".join(lines) + "\r\n"
 
     def add_telephone_event_to_sdp(self, sdp: str) -> str:
@@ -663,10 +645,8 @@ class WebRTCTester:
                     self.to_tag = tag_match.group(1)
                 if not parsed["body"]:
                     raise RuntimeError("200 OK without SDP")
-                sanitized_sdp = self.sanitize_sdp(parsed["body"])
-                if sanitized_sdp.strip() != parsed["body"].strip():
-                    self.logger.info("INFO: remote SDP normalized before aiortc parsing")
-                return RTCSessionDescription(sdp=sanitized_sdp, type="answer")
+                normalized_sdp = self.normalize_sdp(parsed["body"])
+                return RTCSessionDescription(sdp=normalized_sdp, type="answer")
             raise RuntimeError(f"SIP final error: {code}")
 
     async def validate_rtp_phase(self) -> tuple[bool, str]:
@@ -730,8 +710,9 @@ class WebRTCTester:
                 if not register_ok:
                     raise RuntimeError("REGISTER failed after max_attempts")
 
-            self.pc.addTransceiver("audio", direction="sendrecv")
-            self.pc.addTrack(FakeAudioTrack())
+            # Важно: не создаем отдельный audio transceiver до addTrack,
+            # иначе появляется лишняя m-line и отправка RTP может не стартовать.
+            self.pc.addTrack(AudioStreamTrack())
             offer = await self.pc.createOffer()
             await self.pc.setLocalDescription(offer)
             await self.wait_for_ice_gathering(timeout=self.config.timeout)
@@ -759,14 +740,17 @@ class WebRTCTester:
                 await self.pc.setRemoteDescription(answer)
                 remote_description_set = True
             except ValueError as exc:
-                self.logger.info("INFO: remote SDP rejected by aiortc, using raw SDP fallback: %s", exc)
-                rtp_ok, rtp_details = self.validate_rtp_from_raw_sdp(answer.sdp)
-                status = "passed" if rtp_ok else "failed"
-                self.recorder.finish_stage(
-                    rtp_stage,
-                    status,
-                    f"{rtp_details}; aiortc parse error: {exc}",
-                )
+                if self.config.allow_sdp_fallback:
+                    self.logger.info("INFO: remote SDP rejected by aiortc, using raw SDP fallback: %s", exc)
+                    rtp_ok, rtp_details = self.validate_rtp_from_raw_sdp(answer.sdp)
+                    status = "passed" if rtp_ok else "failed"
+                    self.recorder.finish_stage(
+                        rtp_stage,
+                        status,
+                        f"{rtp_details}; aiortc parse error: {exc}",
+                    )
+                else:
+                    raise RuntimeError(f"Remote SDP rejected by aiortc: {exc}") from exc
 
             ack = self.build_sip_ack()
             await self.send_sip(ack)

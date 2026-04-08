@@ -24,6 +24,7 @@ sip_trace: true
 rtp_probe_seconds: 3
 offer_telephone_event: true
 telephone_event_payload: 101
+allow_sdp_fallback: false
 log_file: "autotest.log"
 report_json: "session-report.json"
 report_junit: "junit.xml"
