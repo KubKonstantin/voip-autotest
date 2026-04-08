@@ -740,17 +740,31 @@ class WebRTCTester:
                 await self.pc.setRemoteDescription(answer)
                 remote_description_set = True
             except ValueError as exc:
-                if self.config.allow_sdp_fallback:
-                    self.logger.info("INFO: remote SDP rejected by aiortc, using raw SDP fallback: %s", exc)
-                    rtp_ok, rtp_details = self.validate_rtp_from_raw_sdp(answer.sdp)
-                    status = "passed" if rtp_ok else "failed"
-                    self.recorder.finish_stage(
-                        rtp_stage,
-                        status,
-                        f"{rtp_details}; aiortc parse error: {exc}",
-                    )
-                else:
-                    raise RuntimeError(f"Remote SDP rejected by aiortc: {exc}") from exc
+                # Частый кейс: битая m-line (aiortc: "not enough values to unpack").
+                # Пробуем мягкий ремонт SDP и повторную установку remote description.
+                repaired_sdp = self.sanitize_sdp(answer.sdp)
+                if repaired_sdp != answer.sdp:
+                    try:
+                        repaired_answer = RTCSessionDescription(sdp=repaired_sdp, type="answer")
+                        await self.pc.setRemoteDescription(repaired_answer)
+                        answer = repaired_answer
+                        remote_description_set = True
+                        self.logger.warning("WARN: Remote SDP was repaired before aiortc apply")
+                    except ValueError:
+                        pass
+
+                if not remote_description_set:
+                    if self.config.allow_sdp_fallback:
+                        self.logger.info("INFO: remote SDP rejected by aiortc, using raw SDP fallback: %s", exc)
+                        rtp_ok, rtp_details = self.validate_rtp_from_raw_sdp(answer.sdp)
+                        status = "passed" if rtp_ok else "failed"
+                        self.recorder.finish_stage(
+                            rtp_stage,
+                            status,
+                            f"{rtp_details}; aiortc parse error: {exc}",
+                        )
+                    else:
+                        raise RuntimeError(f"Remote SDP rejected by aiortc: {exc}") from exc
 
             ack = self.build_sip_ack()
             await self.send_sip(ack)
